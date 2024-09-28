@@ -147,7 +147,7 @@ The format of a nameserver is:
       mutable udp_ports : IS.t ;
       mutable flow : [`Plain of S.TCP.flow | `Tls of TLS.flow ] option ;
       mutable connected_condition : (unit, [ `Msg of string ]) result Lwt_condition.t option ;
-      mutable requests : (Cstruct.t * (Cstruct.t, [ `Msg of string ]) result Lwt_condition.t) IM.t ;
+      mutable requests : (string * (string, [ `Msg of string ]) result Lwt_condition.t) IM.t ;
       he : H.t ;
     }
     type context = t
@@ -158,9 +158,9 @@ The format of a nameserver is:
 
     let read_udp t ip ip_us ~src ~dst ~src_port:_ data =
       if Ipaddr.compare ip_us dst = 0 && Ipaddr.compare ip src = 0 &&
-         Cstruct.length data > 12 (* minimum DNS length (header length) *)
+         String.length data > 12 (* minimum DNS length (header length) *)
       then
-        (let id = Cstruct.BE.get_uint16 data 0 in
+        (let id = String.get_uint16_be data 0 in
          (match IM.find_opt id t.requests with
           | None -> Log.warn (fun m -> m "received unsolicited data, ignoring")
           | Some (_, cond) -> Lwt_condition.broadcast cond (Ok data)));
@@ -225,19 +225,19 @@ The format of a nameserver is:
     let bind = Lwt.bind
     let lift = Lwt.return
 
-    let rec read_loop ?(linger = Cstruct.empty) t flow =
+    let rec read_loop ?(linger = "") t flow =
       let process cs =
         let rec handle_data data =
-          let cs_len = Cstruct.length data in
-          if cs_len > 2 then
-            let len = Cstruct.BE.get_uint16 data 0 in
-            if cs_len - 2 >= len then
+          let str_len = String.length data in
+          if str_len > 2 then
+            let len = String.get_uint16_be data 0 in
+            if str_len - 2 >= len then
               let packet, rest =
-                if cs_len - 2 = len
-                then data, Cstruct.empty
-                else Cstruct.split data (len + 2)
+                if str_len - 2 = len
+                then data, ""
+                else String.sub data 0 (len+2), String.sub data (len+2) str_len
               in
-              let id = Cstruct.BE.get_uint16 packet 2 in
+              let id = String.get_uint16_be packet 2 in
               (match IM.find_opt id t.requests with
                | None -> Log.warn (fun m -> m "received unsolicited data, ignoring")
                | Some (_, cond) -> Lwt_condition.broadcast cond (Ok packet));
@@ -247,7 +247,7 @@ The format of a nameserver is:
           else
             read_loop ~linger:data t flow
         in
-        handle_data (if Cstruct.length linger = 0 then cs else Cstruct.append linger cs)
+        handle_data (if linger = "" then cs else linger ^ cs)
       in
       match flow with
       | `Plain flow ->
@@ -393,7 +393,7 @@ The format of a nameserver is:
 
     let send_recv t tx =
       let ( >>>= ) = Lwt_result.bind in
-      if Cstruct.length tx > 4 then
+      if String.length tx > 4 then
         match t.proto, t.flow with
         | `Udp, _ ->
           let dst, dst_port = match t.nameservers with
@@ -401,7 +401,7 @@ The format of a nameserver is:
             | _ -> assert false
           in
           let src = S.IP.src (S.ip t.stack) ~dst in
-          let id = Cstruct.BE.get_uint16 tx 0 in
+          let id = String.get_uint16_be tx 0 in
           Lwt.return (generate_udp_port t) >>>= fun udp_port ->
           with_timeout t.timeout_ns
             (S.UDP.listen (S.udp t.stack) ~port:udp_port (read_udp t dst src);
@@ -419,7 +419,7 @@ The format of a nameserver is:
           r
         | `Tcp, None -> Lwt.return (Error (`Msg "no connection to resolver"))
         | `Tcp, Some flow ->
-          let id = Cstruct.BE.get_uint16 tx 2 in
+          let id = String.get_uint16_be tx 2 in
           with_timeout t.timeout_ns
             (let open Lwt_result.Infix in
              query_one flow tx >>= fun () ->
@@ -433,8 +433,10 @@ The format of a nameserver is:
       else
         Lwt.return (Error (`Msg "invalid context (data length <= 4)"))
 
+(*
     let send_recv t tx =
       Lwt_result.map Cstruct.to_string (send_recv t (Cstruct.of_string tx))
+*)
   end
 
   include Dns_client.Make(Transport)

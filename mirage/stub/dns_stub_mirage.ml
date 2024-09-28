@@ -239,12 +239,10 @@ module Make (R : Mirage_crypto_rng_mirage.S) (T : Mirage_time.S) (P : Mirage_clo
     let reserved = Dns_server.create Dns_resolver_root.reserved R.generate in
     let t = { client ; reserved ; server ; on_update } in
     let udp_cb ~src ~dst:_ ~src_port buf =
-      let buf = Cstruct.to_string buf in
       metrics `Udp_queries;
       handle t `Udp src buf >>= function
       | None -> Lwt.return_unit
       | Some data ->
-        let data = Cstruct.of_string data in
         S.UDP.write ~src_port:53 ~dst:src ~dst_port:src_port (S.udp stack) data >|= function
         | Error e -> Log.warn (fun m -> m "udp: failure %a while sending to %a:%d"
                                   S.UDP.pp_error e Ipaddr.pp src src_port)
@@ -261,13 +259,11 @@ module Make (R : Mirage_crypto_rng_mirage.S) (T : Mirage_time.S) (P : Mirage_clo
         | Error () -> Lwt.return_unit
         | Ok data ->
           metrics `Tcp_queries;
-          let data = Cstruct.to_string data in
           handle t `Tcp dst_ip data >>= function
           | None ->
             Log.warn (fun m -> m "no TCP output") ;
             loop ()
           | Some data ->
-            let data = Cstruct.of_string data in
             Dns_flow.send_tcp flow data >>= function
             | Ok () -> loop ()
             | Error () -> Lwt.return_unit

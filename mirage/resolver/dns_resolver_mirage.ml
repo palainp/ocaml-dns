@@ -13,7 +13,7 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
 
   module TLS = Tls_mirage.Make(T)
 
-  type tls_flow = { tls_flow : TLS.flow ; mutable linger : Cstruct.t }
+  type tls_flow = { tls_flow : TLS.flow ; mutable linger : string }
 
   module FM = Map.Make(struct
       type t = Ipaddr.t * int
@@ -31,9 +31,9 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
     let tcp_out = ref Ipaddr.Map.empty in
 
     let send_tls flow data =
-      let len = Cstruct.create 2 in
-      Cstruct.BE.set_uint16 len 0 (Cstruct.length data);
-      TLS.writev flow [len; data] >>= function
+      let len = Bytes.create 2 in
+      Bytes.set_uint16_be len 0 (String.length data);
+      TLS.writev flow [Bytes.unsafe_to_string len; data] >>= function
       | Ok () -> Lwt.return (Ok ())
       | Error e ->
         Log.err (fun m -> m "tls error %a while writing" TLS.pp_write_error e);
@@ -64,7 +64,6 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
                 let now = Ptime.v (P.now_d_ps ()) in
                 let ts = M.elapsed_ns () in
                 let new_state, answers, queries =
-                  let data = Cstruct.to_string data in
                   Dns_resolver.handle_buf !state now ts false `Tcp dst port data
                 in
                 state := new_state ;
@@ -82,44 +81,43 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
           | Error () ->
             let sport = sport () in
             S.UDP.listen (S.udp stack) ~port:sport (udp_cb sport false) ;
-            Dns.send_udp stack sport dst port (Cstruct.of_string data)
+            Dns.send_udp stack sport dst port data
           | Ok () -> client_tcp dst port data
         end
       | Some x ->
-        Dns.send_tcp x (Cstruct.of_string data) >>= function
+        Dns.send_tcp x data >>= function
         | Ok () -> Lwt.return_unit
         | Error () ->
           tcp_out := Ipaddr.Map.remove dst !tcp_out ;
           client_tcp dst port data
     and maybe_tcp dst port data =
       (match Ipaddr.Map.find_opt dst !tcp_out with
-       | Some flow -> Dns.send_tcp flow (Cstruct.of_string data)
+       | Some flow -> Dns.send_tcp flow data
        | None -> Lwt.return (Error ())) >>= function
       | Ok () -> Lwt.return_unit
       | Error () ->
         let sport = sport () in
         S.UDP.listen (S.udp stack) ~port:sport (udp_cb sport false) ;
-        Dns.send_udp stack sport dst port (Cstruct.of_string data)
+        Dns.send_udp stack sport dst port data
     and handle_query (proto, dst, data) = match proto with
       | `Udp -> maybe_tcp dst port data
       | `Tcp -> client_tcp dst port data
     and handle_answer (proto, dst, dst_port, data) = match proto with
-      | `Udp -> Dns.send_udp stack port dst dst_port (Cstruct.of_string data)
+      | `Udp -> Dns.send_udp stack port dst dst_port data
       | `Tcp -> match try Some (FM.find (dst, dst_port) !tcp_in) with Not_found -> None with
         | None ->
           Log.err (fun m -> m "wanted to answer %a:%d via TCP, but couldn't find a flow"
                        Ipaddr.pp dst dst_port) ;
           Lwt.return_unit
         | Some `Tcp flow ->
-          (Dns.send_tcp flow (Cstruct.of_string data) >|= function
+          (Dns.send_tcp flow data >|= function
            | Ok () -> ()
            | Error () -> tcp_in := FM.remove (dst, dst_port) !tcp_in)
         | Some `Tls flow ->
-          (send_tls flow (Cstruct.of_string data) >|= function
+          (send_tls flow data >|= function
            | Ok () -> ()
            | Error () -> tcp_in := FM.remove (dst, dst_port) !tcp_in)
     and udp_cb lport req ~src ~dst:_ ~src_port buf =
-      let buf = Cstruct.to_string buf in
       let now = Ptime.v (P.now_d_ps ())
       and ts = M.elapsed_ns ()
       in
@@ -149,7 +147,6 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
           tcp_in := FM.remove (dst_ip, dst_port) !tcp_in ;
           Lwt.return_unit
         | Ok data ->
-          let data = Cstruct.to_string data in
           let now = Ptime.v (P.now_d_ps ()) in
           let ts = M.elapsed_ns () in
           let new_state, answers, queries =
@@ -168,8 +165,10 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
     end;
 
     let rec read_tls ({ tls_flow ; linger } as f) length =
-      if Cstruct.length linger >= length then
-        let a, b = Cstruct.split linger length in
+      let len = String.length linger in
+      if len >= length then
+        let a = String.sub linger 0 length in
+        let b = String.sub linger length len in
         f.linger <- b;
         Lwt.return (Ok a)
       else
@@ -177,14 +176,14 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
         | Ok `Eof -> Log.debug (fun m -> m "end of file while reading"); TLS.close tls_flow >|= fun () -> Error ()
         | Error e -> Log.warn (fun m -> m "error reading TLS: %a" TLS.pp_error e); TLS.close tls_flow >|= fun () -> Error ()
         | Ok (`Data d) ->
-          f.linger <- Cstruct.append linger d;
+          f.linger <- linger ^ d;
           read_tls f length
     in
     let read_tls_packet f =
       read_tls f 2 >>= function
       | Error () -> Lwt.return (Error ())
       | Ok k ->
-        let len = Cstruct.BE.get_uint16 k 0 in
+        let len = String.get_uint16_be k 0 in
         read_tls f len
     in
 
@@ -198,14 +197,13 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
       | Ok tls ->
         Log.info (fun m -> m "tls connection from %a:%d" Ipaddr.pp dst_ip dst_port);
         tcp_in := FM.add (dst_ip, dst_port) (`Tls tls) !tcp_in ;
-        let tls_and_linger = { tls_flow = tls ; linger = Cstruct.empty } in
+        let tls_and_linger = { tls_flow = tls ; linger = "" } in
         let rec loop () =
           read_tls_packet tls_and_linger >>= function
           | Error () ->
             tcp_in := FM.remove (dst_ip, dst_port) !tcp_in ;
             Lwt.return_unit
           | Ok data ->
-            let data = Cstruct.to_string data in
             let now = Ptime.v (P.now_d_ps ()) in
             let ts = M.elapsed_ns () in
             let new_state, answers, queries =

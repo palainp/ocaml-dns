@@ -58,7 +58,6 @@ module Make (P : Mirage_clock.PCLOCK) (M : Mirage_clock.MCLOCK) (TIME : Mirage_t
 
     let send_notify recv_task (ip, data) =
       inc `Notify;
-      let data = List.map Cstruct.of_string data in
       let connect_and_send ip =
         connect recv_task ip >>= function
         | Ok flow -> Dns.send_tcp_multiple flow data
@@ -105,7 +104,7 @@ module Make (P : Mirage_clock.PCLOCK) (M : Mirage_clock.MCLOCK) (TIME : Mirage_t
           let now = Ptime.v (P.now_d_ps ()) in
           let ts = M.elapsed_ns () in
           let t, answers, notify, n, key =
-            Dns_server.Primary.handle_buf !state now ts `Tcp ip port (Cstruct.to_string data)
+            Dns_server.Primary.handle_buf !state now ts `Tcp ip port data
           in
           let n' = match n with
             | Some `Keep -> inc `Tcp_cache_add ; inc `Tcp_keep ; tcp_out := Ipaddr.Map.add ip flow !tcp_out ; None
@@ -116,7 +115,6 @@ module Make (P : Mirage_clock.PCLOCK) (M : Mirage_clock.MCLOCK) (TIME : Mirage_t
           maybe_update_state key ip t >>= fun () ->
           maybe_notify recv_task t now ts n' >>= fun () ->
           if answers <> [] then inc `Tcp_answer;
-          let answers = List.map Cstruct.of_string answers in
           (Dns.send_tcp_multiple flow answers >|= function
             | Ok () -> ()
             | Error () -> drop ip) >>= fun () ->
@@ -136,7 +134,6 @@ module Make (P : Mirage_clock.PCLOCK) (M : Mirage_clock.MCLOCK) (TIME : Mirage_t
 
     let udp_cb ~src ~dst:_ ~src_port buf =
       inc `Udp_query;
-      let buf = Cstruct.to_string buf in
       let now = Ptime.v (P.now_d_ps ()) in
       let ts = M.elapsed_ns () in
       let t, answers, notify, n, key =
@@ -150,7 +147,6 @@ module Make (P : Mirage_clock.PCLOCK) (M : Mirage_clock.MCLOCK) (TIME : Mirage_t
       maybe_update_state key src t >>= fun () ->
       maybe_notify recv_task t now ts n' >>= fun () ->
       if answers <> [] then inc `Udp_answer;
-      let answers = List.map Cstruct.of_string answers in
       (Lwt_list.iter_s (Dns.send_udp stack port src src_port) answers) >>= fun () ->
       Lwt_list.iter_p (send_notify recv_task) notify
     in
@@ -205,14 +201,13 @@ module Make (P : Mirage_clock.PCLOCK) (M : Mirage_clock.MCLOCK) (TIME : Mirage_t
         let now = Ptime.v (P.now_d_ps ()) in
         let elapsed = M.elapsed_ns () in
         let t, answer, out =
-          Dns_server.Secondary.handle_buf !state now elapsed `Tcp ip (Cstruct.to_string data)
+          Dns_server.Secondary.handle_buf !state now elapsed `Tcp ip data
         in
         maybe_update_state t >>= fun () ->
         (match answer with
          | None -> Lwt.return (Ok ())
          | Some x ->
            inc `Tcp_answer;
-           let x = Cstruct.of_string x in
            Dns.send_tcp (Dns.flow f) x >>= function
            | Error () ->
              Log.debug (fun m -> m "removing %a from tcp_out" Ipaddr.pp ip) ;
@@ -239,7 +234,6 @@ module Make (P : Mirage_clock.PCLOCK) (M : Mirage_clock.MCLOCK) (TIME : Mirage_t
             close ~timer ip
           | Ok flow ->
             tcp_out := Ipaddr.Map.add ip flow !tcp_out ;
-            let data = List.map Cstruct.of_string data in
             Dns.send_tcp_multiple flow data >>= function
             | Error () -> close ~timer ip
             | Ok () ->
@@ -247,7 +241,6 @@ module Make (P : Mirage_clock.PCLOCK) (M : Mirage_clock.MCLOCK) (TIME : Mirage_t
               Lwt.return_unit
         end
       | Some flow ->
-        let data = List.map Cstruct.of_string data in
         Dns.send_tcp_multiple flow data >>= function
         | Ok () -> Lwt.return_unit
         | Error () ->
@@ -255,7 +248,6 @@ module Make (P : Mirage_clock.PCLOCK) (M : Mirage_clock.MCLOCK) (TIME : Mirage_t
                        Ipaddr.pp ip dport) ;
           T.close flow >>= fun () ->
           tcp_out := Ipaddr.Map.remove ip !tcp_out ;
-          let data = List.map Cstruct.to_string data in
           request ~timer (ip, data)
     and request_one ~timer (ip, d) = request ~timer (ip, [ d ])
     in
@@ -263,7 +255,6 @@ module Make (P : Mirage_clock.PCLOCK) (M : Mirage_clock.MCLOCK) (TIME : Mirage_t
     let udp_cb ~src ~dst:_ ~src_port buf =
       Log.debug (fun m -> m "udp frame from %a:%d" Ipaddr.pp src src_port) ;
       inc `Udp_query;
-      let buf = Cstruct.to_string buf in
       let now = Ptime.v (P.now_d_ps ()) in
       let elapsed = M.elapsed_ns () in
       let t, answer, out =
@@ -277,7 +268,6 @@ module Make (P : Mirage_clock.PCLOCK) (M : Mirage_clock.MCLOCK) (TIME : Mirage_t
       | None -> Lwt.return_unit
       | Some out ->
         inc `Udp_answer;
-        let out = Cstruct.of_string out in
         Dns.send_udp stack port src src_port out
     in
     S.UDP.listen (S.udp stack) ~port udp_cb ;
@@ -294,7 +284,6 @@ module Make (P : Mirage_clock.PCLOCK) (M : Mirage_clock.MCLOCK) (TIME : Mirage_t
         | Error () -> tcp_out := Ipaddr.Map.remove dst_ip !tcp_out ; Lwt.return_unit
         | Ok data ->
           inc `Tcp_query;
-          let data = Cstruct.to_string data in
           let now = Ptime.v (P.now_d_ps ()) in
           let elapsed = M.elapsed_ns () in
           let t, answer, out =
@@ -310,7 +299,6 @@ module Make (P : Mirage_clock.PCLOCK) (M : Mirage_clock.MCLOCK) (TIME : Mirage_t
             loop ()
           | Some data ->
             inc `Tcp_answer;
-            let data = Cstruct.of_string data in
             Dns.send_tcp flow data >>= function
             | Ok () -> loop ()
             | Error () -> tcp_out := Ipaddr.Map.remove dst_ip !tcp_out ; Lwt.return_unit
