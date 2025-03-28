@@ -48,13 +48,13 @@ module Make (S : Tcpip.Stack.V4V6) = struct
         T.close f.flow >>= fun () ->
         Lwt.return (Error ())
       | Ok (`Data b) ->
-        f.linger <- f.linger ^ b ;
+        f.linger <- f.linger ^ (Cstruct.to_string b) ;
         read_exactly f length
 
   let send_udp stack src_port dst dst_port data =
     Log.debug (fun m -> m "udp: sending %d bytes from %d to %a:%d"
                  (String.length data) src_port Ipaddr.pp dst dst_port) ;
-    U.write ~src_port ~dst ~dst_port (S.udp stack) data >|= function
+    U.write ~src_port ~dst ~dst_port (S.udp stack) (Cstruct.of_string data) >|= function
     | Error e -> Log.warn (fun m -> m "udp: failure %a while sending from %d to %a:%d"
                               U.pp_error e src_port Ipaddr.pp dst dst_port)
     | Ok () -> ()
@@ -64,7 +64,8 @@ module Make (S : Tcpip.Stack.V4V6) = struct
     Log.debug (fun m -> m "tcp: sending %d bytes to %a:%d" (String.length answer) Ipaddr.pp dst_ip dst_port) ;
     let len = Bytes.create 2 in
     Bytes.set_uint16_be len 0 (String.length answer) ;
-    T.write flow ((Bytes.unsafe_to_string len) ^ answer) >>= function
+    let data = ((Bytes.unsafe_to_string len) ^ answer) in
+    T.write flow (Cstruct.of_string data) >>= function
     | Ok () -> Lwt.return (Ok ())
     | Error e ->
       Log.err (fun m -> m "tcp: error %a while writing to %a:%d" T.pp_write_error e Ipaddr.pp dst_ip dst_port) ;

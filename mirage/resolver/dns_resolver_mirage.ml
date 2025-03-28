@@ -5,7 +5,7 @@ open Lwt.Infix
 let src = Logs.Src.create "dns_resolver_mirage" ~doc:"effectful DNS resolver"
 module Log = (val Logs.src_log src : Logs.LOG)
 
-module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mirage_clock.MCLOCK) (TIME : Mirage_time.S) (S : Tcpip.Stack.V4V6) = struct
+module Make (S : Tcpip.Stack.V4V6) = struct
 
   module Dns = Dns_mirage.Make(S)
 
@@ -25,7 +25,7 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
 
   let resolver stack ?(root = false) ?(timer = 500) ?(udp = true) ?(tcp = true) ?tls ?(port = 53) ?(tls_port = 853) t =
     (* according to RFC5452 4.5, we can chose source port between 1024-49152 *)
-    let sport () = 1024 + Randomconv.int ~bound:48128 R.generate in
+    let sport () = 1024 + Randomconv.int ~bound:48128 Mirage_crypto_rng.generate in
     let state = ref t in
     let tcp_in = ref FM.empty in
     let tcp_out = ref Ipaddr.Map.empty in
@@ -33,7 +33,7 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
     let send_tls flow data =
       let len = Bytes.create 2 in
       Bytes.set_uint16_be len 0 (String.length data);
-      TLS.writev flow [Bytes.unsafe_to_string len; data] >>= function
+      TLS.writev flow [Cstruct.of_string ((Bytes.unsafe_to_string len) ^ data)] >>= function
       | Ok () -> Lwt.return (Ok ())
       | Error e ->
         Log.err (fun m -> m "tls error %a while writing" TLS.pp_write_error e);
@@ -61,8 +61,8 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
                 tcp_out := Ipaddr.Map.remove dst !tcp_out ;
                 Lwt.return_unit
               | Ok data ->
-                let now = Ptime.v (P.now_d_ps ()) in
-                let ts = M.elapsed_ns () in
+                let now = Ptime.v (Mirage_ptime.now_d_ps ()) in
+                let ts = Mirage_mtime.elapsed_ns () in
                 let new_state, answers, queries =
                   Dns_resolver.handle_buf !state now ts false `Tcp dst port data
                 in
@@ -118,11 +118,11 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
            | Ok () -> ()
            | Error () -> tcp_in := FM.remove (dst, dst_port) !tcp_in)
     and udp_cb lport req ~src ~dst:_ ~src_port buf =
-      let now = Ptime.v (P.now_d_ps ())
-      and ts = M.elapsed_ns ()
+      let now = Ptime.v (Mirage_ptime.now_d_ps ())
+      and ts = Mirage_mtime.elapsed_ns ()
       in
       let new_state, answers, queries =
-        Dns_resolver.handle_buf !state now ts req `Udp src src_port buf
+        Dns_resolver.handle_buf !state now ts req `Udp src src_port (Cstruct.to_string buf)
       in
       if not req then
         (Log.app (fun m -> m "unlisten on UDP %d" src_port);
@@ -147,8 +147,8 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
           tcp_in := FM.remove (dst_ip, dst_port) !tcp_in ;
           Lwt.return_unit
         | Ok data ->
-          let now = Ptime.v (P.now_d_ps ()) in
-          let ts = M.elapsed_ns () in
+          let now = Ptime.v (Mirage_ptime.now_d_ps ()) in
+          let ts = Mirage_mtime.elapsed_ns () in
           let new_state, answers, queries =
             Dns_resolver.handle_buf !state now ts query `Tcp dst_ip dst_port data
           in
@@ -176,7 +176,7 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
         | Ok `Eof -> Log.debug (fun m -> m "end of file while reading"); TLS.close tls_flow >|= fun () -> Error ()
         | Error e -> Log.warn (fun m -> m "error reading TLS: %a" TLS.pp_error e); TLS.close tls_flow >|= fun () -> Error ()
         | Ok (`Data d) ->
-          f.linger <- linger ^ d;
+          f.linger <- linger ^ (Cstruct.to_string d);
           read_tls f length
     in
     let read_tls_packet f =
@@ -204,8 +204,8 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
             tcp_in := FM.remove (dst_ip, dst_port) !tcp_in ;
             Lwt.return_unit
           | Ok data ->
-            let now = Ptime.v (P.now_d_ps ()) in
-            let ts = M.elapsed_ns () in
+            let now = Ptime.v (Mirage_ptime.now_d_ps ()) in
+            let ts = Mirage_mtime.elapsed_ns () in
             let new_state, answers, queries =
               Dns_resolver.handle_buf !state now ts true `Tcp dst_ip dst_port data
             in
@@ -224,22 +224,22 @@ module Make (R : Mirage_crypto_rng_mirage.S) (P : Mirage_clock.PCLOCK) (M : Mira
 
     let rec time () =
       let new_state, answers, queries =
-        Dns_resolver.timer !state (M.elapsed_ns ())
+        Dns_resolver.timer !state (Mirage_mtime.elapsed_ns ())
       in
       state := new_state ;
       Lwt_list.iter_p handle_answer answers >>= fun () ->
       Lwt_list.iter_p handle_query queries >>= fun () ->
-      TIME.sleep_ns (Duration.of_ms timer) >>= fun () ->
+      Mirage_sleep.ns (Duration.of_ms timer) >>= fun () ->
       time ()
     in
     Lwt.async time ;
 
     if root then
       let rec root () =
-        let new_state, q = Dns_resolver.query_root !state (M.elapsed_ns ()) `Tcp in
+        let new_state, q = Dns_resolver.query_root !state (Mirage_mtime.elapsed_ns ()) `Tcp in
         state := new_state ;
         handle_query q >>= fun () ->
-        TIME.sleep_ns (Duration.of_day 6) >>= fun () ->
+        Mirage_sleep.ns (Duration.of_day 6) >>= fun () ->
         root ()
       in
       Lwt.async root

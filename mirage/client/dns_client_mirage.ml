@@ -33,17 +33,12 @@ module type S = sig
 end
 
 module Make
-  (R : Mirage_crypto_rng_mirage.S)
-  (T : Mirage_time.S)
-  (M : Mirage_clock.MCLOCK)
-  (P : Mirage_clock.PCLOCK)
   (S : Tcpip.Stack.V4V6)
   (H : Happy_eyeballs_mirage.S with type stack = S.t
                                 and type flow = S.TCP.flow) = struct
   type happy_eyeballs = H.t
 
   module TLS = Tls_mirage.Make(S.TCP)
-  module CA = Ca_certs_nss.Make(P)
 
   let auth_err = match X509.Authenticator.of_string "" with
     | Ok _ -> "should not happen"
@@ -86,7 +81,7 @@ The format of a nameserver is:
         ( match String.split_on_char '!' str with
           | [ nameserver ] ->
             let* ipaddr, port = Ipaddr.with_port_of_string ~default:853 nameserver in
-            let* authenticator = CA.authenticator () in
+            let* authenticator = Ca_certs_nss.authenticator () in
             let* tls = Tls.Config.client ~authenticator () in
             Ok (`Tcp, `Tls (tls, ipaddr, port))
           | nameserver :: opt_hostname :: authenticator ->
@@ -101,10 +96,10 @@ The format of a nameserver is:
             in
             let* authenticator =
               if data = "" then
-                CA.authenticator ()
+                Ca_certs_nss.authenticator ()
               else
                 let* a = X509.Authenticator.of_string data in
-                Ok (a (fun () -> Some (Ptime.v (P.now_d_ps ()))))
+                Ok (a (fun () -> Some (Ptime.v (Mirage_ptime.now_d_ps ()))))
             in
             let* tls = Tls.Config.client ~authenticator ?peer_name () in
             Ok (`Tcp, `Tls (tls, ipaddr, port))
@@ -152,11 +147,12 @@ The format of a nameserver is:
     }
     type context = t
 
-    let clock = M.elapsed_ns
+    let clock = Mirage_mtime.elapsed_ns
 
     let happy_eyeballs { he ; _ } = he
 
     let read_udp t ip ip_us ~src ~dst ~src_port:_ data =
+      let data = Cstruct.to_string data in
       if Ipaddr.compare ip_us dst = 0 && Ipaddr.compare ip src = 0 &&
          String.length data > 12 (* minimum DNS length (header length) *)
       then
@@ -171,7 +167,7 @@ The format of a nameserver is:
         if retries = 0 then
           Error (`Msg "couldn't find a free UDP port")
         else
-          let port = 1024 + ((String.get_uint16_be (R.generate 2) 0) mod (65536 - 1024)) in
+          let port = 1024 + ((String.get_uint16_be (Mirage_crypto_rng.generate 2) 0) mod (65536 - 1024)) in
           if IS.mem port t.udp_ports then
             go (retries - 1)
           else
@@ -183,7 +179,7 @@ The format of a nameserver is:
     let create ?nameservers ~timeout (stack, he) =
       let proto, nameservers = match nameservers with
         | None ->
-          let authenticator = match CA.authenticator () with
+          let authenticator = match Ca_certs_nss.authenticator () with
             | Ok a -> a
             | Error `Msg m -> invalid_arg ("bad CA certificates " ^ m)
           in
@@ -213,11 +209,11 @@ The format of a nameserver is:
       }
 
     let nameservers { proto ; nameservers ; _ } = proto, nameservers
-    let rng n = R.generate ?g:None n
+    let rng n = Mirage_crypto_rng.generate ?g:None n
 
     let with_timeout time_left f =
       let timeout =
-        T.sleep_ns time_left >|= fun () ->
+        Mirage_sleep.ns time_left >|= fun () ->
         Error (`Msg "DNS request timeout")
       in
       Lwt.pick [ f ; timeout ]
@@ -263,7 +259,7 @@ The format of a nameserver is:
               Log.info (fun m -> m "end of file reading from resolver");
             Lwt.return_unit
           | Ok (`Data cs) ->
-            process cs
+            process (Cstruct.to_string cs)
         end
       | `Tls flow ->
         begin
@@ -278,10 +274,11 @@ The format of a nameserver is:
               Log.info (fun m -> m "end of file reading from resolver");
             Lwt.return_unit
           | Ok (`Data cs) ->
-            process cs
+            process (Cstruct.to_string cs)
         end
 
     let query_one flow data =
+      let data = Cstruct.of_string data in
       match flow with
       | `Plain flow ->
         begin
@@ -405,7 +402,7 @@ The format of a nameserver is:
           Lwt.return (generate_udp_port t) >>>= fun udp_port ->
           with_timeout t.timeout_ns
             (S.UDP.listen (S.udp t.stack) ~port:udp_port (read_udp t dst src);
-             (S.UDP.write ~src_port:udp_port ~dst ~dst_port (S.udp t.stack) tx >|= function
+             (S.UDP.write ~src_port:udp_port ~dst ~dst_port (S.udp t.stack) (Cstruct.of_string tx) >|= function
                | Error e -> Error (`Msg (Fmt.to_to_string S.UDP.pp_error e))
                | Ok () -> Ok ()) >>>= fun () ->
              let cond = Lwt_condition.create () in
